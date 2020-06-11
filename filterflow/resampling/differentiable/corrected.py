@@ -8,6 +8,19 @@ from filterflow.resampling.base import ResamplerBase
 from filterflow.resampling.differentiable.biased import apply_transport_matrix
 from filterflow.resampling.differentiable.regularized_transport.plan import transport
 from filterflow.resampling.differentiable.ricatti.solver import PetkovSolver
+from filterflow.utils import mean, std
+from filterflow.resampling.criterion import neff
+
+
+@tf.function
+def _fill_na(x):
+    return tf.where(tf.math.is_finite(x), x, 1.)
+
+
+@tf.function
+def _make_alpha(log_weighted_std, log_transformed_std):
+    res = _fill_na(tf.exp(log_weighted_std - log_transformed_std))
+    return res
 
 
 class CorrectedRegularizedTransform(ResamplerBase, metaclass=abc.ABCMeta):
@@ -37,7 +50,7 @@ class CorrectedRegularizedTransform(ResamplerBase, metaclass=abc.ABCMeta):
         self.scaling = tf.cast(scaling, float)
         self.propagate_correction_gradient = propagate_correction_gradient
         if ricatti_solver is None:
-            self.ricatti_solver = PetkovSolver(tf.constant(10))
+            self.ricatti_solver = PetkovSolver(tf.constant(50))
         else:
             self.ricatti_solver = ricatti_solver
         super(CorrectedRegularizedTransform, self).__init__(name=name)
@@ -62,6 +75,7 @@ class CorrectedRegularizedTransform(ResamplerBase, metaclass=abc.ABCMeta):
             transport_correction = tf.stop_gradient(transport_correction)
         res = apply_transport_matrix(state, transport_matrix + transport_correction, flags)
         return res
+
 
 
 class PartiallyCorrectedRegularizedTransform(ResamplerBase, metaclass=abc.ABCMeta):
@@ -93,15 +107,17 @@ class PartiallyCorrectedRegularizedTransform(ResamplerBase, metaclass=abc.ABCMet
         # TODO: The real batch_size is the sum of flags. We shouldn't do more operations than we need...
         resampled_state = self.intermediate_resampler.apply(state, flags)
 
-        weights = tf.expand_dims(state.weights, -1)
-
-        weighted_average = tf.reduce_sum(weights * state.particles, axis=[1], keepdims=True)
-        centered_particles = state.particles - weighted_average
-        weighted_std = tf.math.sqrt(tf.reduce_sum(weights * centered_particles ** 2, axis=[1], keepdims=True))
-
-        transformed_std = tf.math.reduce_std(resampled_state.particles, axis=[1], keepdims=True)
-        alpha = tf.where(transformed_std > 0, weighted_std / transformed_std, 1.)
-        alpha = tf.clip_by_value(tf.stop_gradient(alpha), 0.5, 2.)
+        _, ess = neff(state.weights, assume_normalized=True, is_log=False, threshold=tf.constant(0.))
+        weighted_average = mean(state, is_log=False)
+        weighted_std = std(state, weighted_average, is_log=True)
+        transformed_std = std(resampled_state, is_log=True)
+        alpha = tf.where(tf.reshape(ess > 3., [-1, 1, 1]), _make_alpha(weighted_std, transformed_std), 1.)
+        # Otherwise weighted std doesn't mean anything
         beta = (1. - alpha) * weighted_average
+        particles = alpha * resampled_state.particles + beta
 
-        return attr.evolve(resampled_state, particles=alpha * resampled_state.particles + beta)
+        particles = tf.stop_gradient(particles - resampled_state.particles) + resampled_state.particles
+
+        new_state = attr.evolve(resampled_state, particles=particles)
+
+        return new_state
